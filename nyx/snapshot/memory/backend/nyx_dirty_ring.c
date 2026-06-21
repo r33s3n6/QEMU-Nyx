@@ -463,22 +463,112 @@ static uint32_t restore_memory_parallel(nyx_dirty_ring_t          *self,
     return total;
 }
 
+/* ---- ping-pong double-buffer load-bearing-cost probe (T5b, env-gated, off by default) ----
+ * Plan research/plans/2026-06-21-05-restore-acceleration.md §3.C wants to know if a ping-pong
+ * double buffer makes "the restore operation itself" near-free. Its two load-bearing costs are
+ *   (a) the KVM memslot switch ioctl, and
+ *   (b) the EPT re-fault tax the guest then pays rebuilding its working set on the next run.
+ * Crucially, (b) is IDENTICAL whether the guest resumes on the same buffer with a zapped EPT or
+ * on a second already-clean buffer (both start from an empty EPT). So we can measure both costs
+ * WITHOUT building the full double buffer: after the normal memcpy restore (which keeps guest
+ * memory correct), we delete+re-add each writable memslot with the SAME ram pointer. The delete
+ * tears down that slot's EPT; the next guest run re-faults its whole working set. This is the
+ * exact tax ping-pong would impose every restore (current memcpy restore pays ZERO of it).
+ *   NYX_PINGPONG_PROBE=1 : zap EPT only (delete+re-add).
+ *   NYX_PINGPONG_PROBE=2 : zap + host-side prefault (touch every page after re-add). NOTE
+ *     KVM_PRE_FAULT_MEMORY is unavailable on this kernel, so this only warms HOST page tables,
+ *     it cannot pre-build EPT — measuring how little host prefault helps is itself a result. */
+static void pingpong_zap_and_prefault(nyx_dirty_ring_t *self, int prefault,
+                                      uint64_t *zap_ns, uint64_t *pf_ns)
+{
+    int                vm_fd = kvm_get_vm_fd(kvm_state);
+    KVMMemoryListener *kml   = kvm_get_kml(0);
+
+    uint64_t a = prof_now_ns();
+    for (uint8_t i = 0; i < self->kvm_region_slots_num; i++) {
+        if (!self->kvm_region_slots[i].enabled) {
+            continue;
+        }
+        KVMSlot *ks = &kml->slots[i];
+        if (ks->memory_size == 0) {
+            continue;
+        }
+        struct kvm_userspace_memory_region mem;
+        mem.slot            = ks->slot | (kml->as_id << 16);
+        mem.guest_phys_addr = ks->start_addr;
+        mem.userspace_addr  = (uintptr_t)ks->ram;
+        mem.flags           = ks->flags;
+        mem.memory_size     = 0; /* delete -> tears down this slot's EPT */
+        if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mem) != 0) {
+            nyx_abort("pingpong: memslot delete (slot %d) failed\n", ks->slot);
+        }
+        mem.memory_size = ks->memory_size; /* re-add same ram ptr -> empty EPT */
+        if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mem) != 0) {
+            nyx_abort("pingpong: memslot re-add (slot %d) failed\n", ks->slot);
+        }
+    }
+    uint64_t b = prof_now_ns();
+
+    if (prefault) {
+        for (uint8_t i = 0; i < self->kvm_region_slots_num; i++) {
+            if (!self->kvm_region_slots[i].enabled) {
+                continue;
+            }
+            KVMSlot *ks = &kml->slots[i];
+            if (ks->memory_size == 0) {
+                continue;
+            }
+            volatile uint8_t *p   = (volatile uint8_t *)ks->ram;
+            uint64_t          sz  = ks->memory_size;
+            uint64_t          acc = 0;
+            for (uint64_t off = 0; off < sz; off += TARGET_PAGE_SIZE) {
+                acc += p[off];
+            }
+            (void)acc;
+        }
+    }
+    uint64_t c = prof_now_ns();
+
+    *zap_ns += (b - a);
+    *pf_ns  += (c - b);
+}
+
+static void pingpong_tick(nyx_dirty_ring_t *self, int pingpong)
+{
+    static uint64_t acc_zap = 0, acc_pf = 0, n = 0;
+    pingpong_zap_and_prefault(self, pingpong >= 2, &acc_zap, &acc_pf);
+    n++;
+    if (n % 200 == 0) {
+        fprintf(stderr,
+                "[pingpong-probe] mode=%d n=%lu zap=%.1fus prefault=%.1fus\n",
+                pingpong, (unsigned long)n, acc_zap / 1000.0 / (double)n,
+                acc_pf / 1000.0 / (double)n);
+    }
+}
+
 uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
                                              shadow_memory_t  *shadow_memory_state,
                                              snapshot_page_blocklist_t *blocklist)
 {
-    static int prof = -1, nt = 0;
+    static int prof = -1, nt = 0, pingpong = 0;
     if (prof < 0) {
         prof = getenv("NYX_RESTORE_PROFILE") ? 1 : 0;
         const char *e = getenv("NYX_RESTORE_PARALLEL");
         nt = e ? atoi(e) : 0;
+        const char *pp = getenv("NYX_PINGPONG_PROBE");
+        pingpong = pp ? atoi(pp) : 0;
     }
 
     if (!prof) {
         dirty_ring_flush_and_collect(self, shadow_memory_state, blocklist,
                                      kvm_get_vm_fd(kvm_state));
-        return nt > 0 ? restore_memory_parallel(self, shadow_memory_state, blocklist, nt)
-                      : restore_memory(self, shadow_memory_state, blocklist);
+        uint32_t r = nt > 0 ? restore_memory_parallel(self, shadow_memory_state,
+                                                      blocklist, nt)
+                            : restore_memory(self, shadow_memory_state, blocklist);
+        if (pingpong) {
+            pingpong_tick(self, pingpong);
+        }
+        return r;
     }
 
     /* ---- profiled path ---- */
@@ -535,6 +625,9 @@ uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
                 nt, (unsigned long)n, (double)acc_dirty / (double)n, col_us,
                 tot ? 100.0 * col_us / tot : 0.0, wb_us,
                 tot ? 100.0 * wb_us / tot : 0.0, tot, R);
+    }
+    if (pingpong) {
+        pingpong_tick(self, pingpong);
     }
     return ret;
 }
