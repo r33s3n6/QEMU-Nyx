@@ -11,6 +11,7 @@
 #include "sysemu/kvm_int.h"
 
 #include <linux/kvm.h>
+#include <pthread.h>  /* T5a: parallel restore prototype */
 
 #define FAST_IN_RANGE(address, start, end) (address < end && address >= start)
 
@@ -371,13 +372,171 @@ static void save_root_pages(nyx_dirty_ring_t          *self,
     }
 }
 
+/* T5a restore profiler + parallel-writeback prototype (env-gated, off by default — hot path).
+ *  NYX_RESTORE_PROFILE=1  : split per-restore cost into (1) collect+reprotect vs (2) writeback,
+ *    and measure re-touch ratio R = |this dirty ∩ prev dirty| / |prev dirty|.
+ *  NYX_RESTORE_PARALLEL=N : do the page writeback with N host threads (memcpy is bandwidth-bound;
+ *    serial restore is single-core). N=0/unset -> serial restore_memory(). */
+static inline uint64_t prof_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct {
+    nyx_dirty_ring_t          *self;
+    shadow_memory_t           *sms;
+    snapshot_page_blocklist_t *bl;
+    uint8_t  slot;
+    uint64_t lo, hi;
+    uint32_t count;
+} restore_task_t;
+
+static void *restore_worker(void *arg)
+{
+    restore_task_t  *t   = (restore_task_t *)arg;
+    slot_t          *s   = &t->self->kvm_region_slots[t->slot];
+    shadow_memory_t *sms = t->sms;
+    uint64_t  rid         = s->region_id;
+    uint64_t  region_base = sms->ram_regions[rid].base;
+    uint64_t  roff        = s->region_offset;
+    void     *host_base   = sms->ram_regions[rid].host_region_ptr;
+    void     *snap_base   = sms->incremental_enabled
+                                ? sms->ram_regions[rid].incremental_region_ptr
+                                : sms->ram_regions[rid].snapshot_region_ptr;
+    uint32_t c = 0;
+    for (uint64_t i = t->lo; i < t->hi; i++) {
+        uint64_t eoa = roff + (s->stack[i] << 12);
+        if (snapshot_page_blocklist_check_phys_addr(t->bl, region_base + eoa)) {
+            continue;
+        }
+        memcpy(host_base + eoa, snap_base + eoa, TARGET_PAGE_SIZE);
+        c++;
+    }
+    t->count = c;
+    return NULL;
+}
+
+/* Partition each slot's dirty stack across `nt` threads. Bitmap cleared via one memset at the end
+ * (whole dirty set is reverted) to avoid non-atomic clear_bit() races between threads. */
+static uint32_t restore_memory_parallel(nyx_dirty_ring_t          *self,
+                                        shadow_memory_t           *shadow_memory_state,
+                                        snapshot_page_blocklist_t *blocklist,
+                                        int                        nt)
+{
+    uint32_t total = 0;
+    for (uint8_t j = 0; j < self->kvm_region_slots_num; j++) {
+        slot_t *s = &self->kvm_region_slots[j];
+        if (!(s->enabled && s->stack_ptr)) {
+            continue;
+        }
+        uint64_t n  = s->stack_ptr;
+        int      tu = (n < 1024) ? 1 : nt; /* tiny dirty set: thread overhead not worth it */
+        if (tu > 64) {
+            tu = 64;
+        }
+        pthread_t      th[64];
+        restore_task_t tk[64];
+        uint64_t       per = (n + tu - 1) / tu;
+        for (int k = 0; k < tu; k++) {
+            tk[k].self = self; tk[k].sms = shadow_memory_state; tk[k].bl = blocklist;
+            tk[k].slot = j; tk[k].lo = (uint64_t)k * per;
+            tk[k].hi = ((uint64_t)(k + 1) * per > n) ? n : (uint64_t)(k + 1) * per;
+            tk[k].count = 0;
+        }
+        if (tu == 1) {
+            restore_worker(&tk[0]);
+            total += tk[0].count;
+        } else {
+            for (int k = 0; k < tu; k++) {
+                pthread_create(&th[k], NULL, restore_worker, &tk[k]);
+            }
+            for (int k = 0; k < tu; k++) {
+                pthread_join(th[k], NULL);
+                total += tk[k].count;
+            }
+        }
+        memset(s->bitmap, 0, s->bitmap_size);
+        s->stack_ptr = 0;
+    }
+    return total;
+}
+
 uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
                                              shadow_memory_t  *shadow_memory_state,
                                              snapshot_page_blocklist_t *blocklist)
 {
+    static int prof = -1, nt = 0;
+    if (prof < 0) {
+        prof = getenv("NYX_RESTORE_PROFILE") ? 1 : 0;
+        const char *e = getenv("NYX_RESTORE_PARALLEL");
+        nt = e ? atoi(e) : 0;
+    }
+
+    if (!prof) {
+        dirty_ring_flush_and_collect(self, shadow_memory_state, blocklist,
+                                     kvm_get_vm_fd(kvm_state));
+        return nt > 0 ? restore_memory_parallel(self, shadow_memory_state, blocklist, nt)
+                      : restore_memory(self, shadow_memory_state, blocklist);
+    }
+
+    /* ---- profiled path ---- */
+    static uint64_t acc_collect_ns = 0, acc_writeback_ns = 0;
+    static uint64_t acc_dirty = 0, acc_overlap = 0, acc_prev = 0, n = 0;
+    static void    *prev_bm[16]  = { 0 };
+    static uint64_t prev_cnt[16] = { 0 };
+
+    uint64_t t0 = prof_now_ns();
     dirty_ring_flush_and_collect(self, shadow_memory_state, blocklist,
                                  kvm_get_vm_fd(kvm_state));
-    return restore_memory(self, shadow_memory_state, blocklist);
+    uint64_t t1 = prof_now_ns();
+
+    /* R: overlap of THIS round's dirty set with the PREVIOUS round's, per slot.
+     * Must run BEFORE the writeback clears the per-slot stacks/bitmaps. */
+    uint64_t this_dirty = 0;
+    for (uint8_t j = 0; j < self->kvm_region_slots_num && j < 16; j++) {
+        slot_t *s = &self->kvm_region_slots[j];
+        if (!prev_bm[j]) {
+            prev_bm[j] = calloc(1, s->bitmap_size);
+        }
+        for (uint64_t i = 0; i < s->stack_ptr; i++) {
+            this_dirty++;
+            if (test_bit(s->stack[i], (unsigned long *)prev_bm[j])) {
+                acc_overlap++;
+            }
+        }
+        acc_prev += prev_cnt[j];
+        memset(prev_bm[j], 0, s->bitmap_size);
+        for (uint64_t i = 0; i < s->stack_ptr; i++) {
+            set_bit(s->stack[i], (unsigned long *)prev_bm[j]);
+        }
+        prev_cnt[j] = s->stack_ptr;
+    }
+
+    uint64_t t2  = prof_now_ns();
+    uint32_t ret = nt > 0 ? restore_memory_parallel(self, shadow_memory_state, blocklist, nt)
+                          : restore_memory(self, shadow_memory_state, blocklist);
+    uint64_t t3  = prof_now_ns();
+
+    acc_collect_ns   += (t1 - t0);
+    acc_writeback_ns += (t3 - t2);
+    acc_dirty        += this_dirty;
+    n++;
+
+    if (n % 200 == 0) {
+        double col_us = acc_collect_ns / 1000.0 / (double)n;
+        double wb_us  = acc_writeback_ns / 1000.0 / (double)n;
+        double tot    = col_us + wb_us;
+        double R      = acc_prev ? (double)acc_overlap / (double)acc_prev : 0.0;
+        fprintf(stderr,
+                "[restore-prof] nt=%d n=%lu dirty_avg=%.0f collect=%.1fus(%.0f%%) "
+                "writeback=%.1fus(%.0f%%) total=%.1fus R_retouch=%.3f\n",
+                nt, (unsigned long)n, (double)acc_dirty / (double)n, col_us,
+                tot ? 100.0 * col_us / tot : 0.0, wb_us,
+                tot ? 100.0 * wb_us / tot : 0.0, tot, R);
+    }
+    return ret;
 }
 
 void nyx_snapshot_nyx_dirty_ring_save_root_pages(nyx_dirty_ring_t *self,
