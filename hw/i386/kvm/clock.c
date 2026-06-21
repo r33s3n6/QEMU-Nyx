@@ -110,6 +110,91 @@ static uint64_t kvmclock_current_nsec(KVMClockState *s)
     return nsec + time.system_time;
 }
 
+#ifdef QEMU_NYX
+/*
+ * Forensic spike (stalefuzz, 2026-06-21): non-invasive dump of the kvmclock
+ * device state + the guest-visible pvclock page, called at tmp-snapshot create
+ * and restore.  Goal: pin WHICH value reverts to the ROOT level on tmp restore
+ * (the device s->clock, vs the guest pvclock memory page, vs a TSC ordering
+ * artifact).  Read-only; gated by env NYX_CLOCK_DEBUG so normal runs are silent.
+ */
+static KVMClockState *nyx_clock_singleton = NULL;
+static bool nyx_clock_debug_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NYX_CLOCK_DEBUG");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+/*
+ * Fix (stalefuzz, 2026-06-21): align the tmp (incremental) snapshot's kvmclock
+ * device state with how the ROOT snapshot captures its own.
+ *
+ * The ROOT snapshot refreshes s->clock to the live guest-visible clock at save
+ * time (savevm -> kvmclock_pre_save -> kvm_update_clock).  The tmp snapshot does
+ * NOT: fdl_fast_create_tmp() just copies the *current* s->clock into the tmp
+ * device-state buffer, and at tmp-create time s->clock still holds the stale
+ * ROOT-era value (verified: s->clock is inert across root/tmp while the guest
+ * pvclock page has advanced ~100us+).  So the tmp restores the ROOT kvmclock
+ * base, and KVM_SET_CLOCK(s->clock) on reload pins the guest clock below what it
+ * observed inside the tmp prefix -> non-monotonic across the tmp boundary.
+ *
+ * This refreshes s->clock to the deterministic guest-visible pvclock value
+ * (kvmclock_current_nsec, computed against the frozen tmp TSC + pvclock page) so
+ * fdl_fast_create_tmp captures the tmp's OWN clock.  The existing restore path
+ * (mblock -> s->clock -> kvmclock_vm_state_change -> KVM_SET_CLOCK) then pins the
+ * correct, frozen, deterministic value.  No live ioctl is added on the restore
+ * side; tmp simply stores its own device state, mirroring root.
+ *
+ * Must be called BEFORE fdl_fast_create_tmp() copies the device state (i.e. at
+ * the very start of nyx_device_state_switch_incremental), with the VM stopped
+ * and env->tsc already at the tmp TSC.
+ */
+void nyx_kvmclock_capture_for_tmp(void);
+void nyx_kvmclock_capture_for_tmp(void)
+{
+    if (!fuzz_mode || !nyx_clock_singleton) {
+        return;
+    }
+    uint64_t v = kvmclock_current_nsec(nyx_clock_singleton);
+    if (v) {
+        nyx_clock_singleton->clock = v;
+    }
+}
+
+void nyx_clock_debug_dump(const char *tag);
+void nyx_clock_debug_dump(const char *tag)
+{
+    if (!nyx_clock_debug_on() || !nyx_clock_singleton || !first_cpu) {
+        return;
+    }
+    KVMClockState *s   = nyx_clock_singleton;
+    CPUState      *cpu = first_cpu;
+    CPUX86State   *env = cpu->env_ptr;
+    uint64_t       tsc = env->tsc;
+    uint64_t       page_pa = 0, page_system_time = 0, page_tsc_timestamp = 0;
+    uint32_t       page_version = 0;
+
+    if (env->system_time_msr & 1ULL) {
+        struct pvclock_vcpu_time_info t;
+        page_pa = env->system_time_msr & ~1ULL;
+        cpu_physical_memory_read(page_pa, &t, sizeof(t));
+        page_system_time   = t.system_time;
+        page_tsc_timestamp = t.tsc_timestamp;
+        page_version       = t.version;
+    }
+    fprintf(stderr,
+            "[nyxclk] %-10s s->clock=%" PRIu64 " env->tsc=%" PRIu64
+            " pv{pa=0x%" PRIx64 " ver=%u system_time=%" PRIu64
+            " tsc_timestamp=%" PRIu64 "}\n",
+            tag, s->clock, tsc, page_pa, page_version, page_system_time,
+            page_tsc_timestamp);
+}
+#endif
+
 static void kvm_update_clock(KVMClockState *s)
 {
     struct kvm_clock_data data;
@@ -249,6 +334,7 @@ static void kvmclock_realize(DeviceState *dev, Error **errp)
     qemu_add_vm_change_state_handler(kvmclock_vm_state_change, s);
 #ifdef QEMU_NYX
     add_fast_reload_change_handler(kvmclock_vm_state_change, s, RELOAD_HANDLER_KVM_CLOCK);
+    nyx_clock_singleton = s; /* forensic spike: enable nyx_clock_debug_dump() */
 #endif
 }
 

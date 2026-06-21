@@ -34,6 +34,15 @@
 extern void enable_fast_snapshot_rtc(void);
 extern void enable_fast_snapshot_kvm_clock(void);
 
+/* forensic spike (stalefuzz 2026-06-21): see hw/i386/kvm/clock.c. Read-only dump
+ * of kvmclock device state + guest pvclock page, to pin what reverts to root on
+ * tmp restore. Gated by env NYX_CLOCK_DEBUG. */
+extern void nyx_clock_debug_dump(const char *tag);
+/* fix (stalefuzz 2026-06-21): refresh s->clock to the guest-visible clock at
+ * tmp-create so the tmp captures its OWN kvmclock base (not the stale root one).
+ * See hw/i386/kvm/clock.c. Called before fdl_fast_create_tmp copies device state. */
+extern void nyx_kvmclock_capture_for_tmp(void);
+
 static void enable_fast_snapshot_mode(void)
 {
     enable_fast_snapshot_rtc();
@@ -434,6 +443,10 @@ nyx_device_state_t *nyx_device_state_init(void)
 void nyx_device_state_switch_incremental(nyx_device_state_t *self)
 {
     self->incremental_mode = true;
+    /* fix: refresh s->clock to the tmp's own guest-visible clock BEFORE
+     * fdl_fast_create_tmp copies the device state (otherwise tmp captures the
+     * stale ROOT s->clock -> guest clock reverts across the tmp boundary). */
+    nyx_kvmclock_capture_for_tmp();
     fdl_fast_create_tmp(self->qemu_state);
     fdl_fast_enable_tmp(self->qemu_state);
 }
@@ -446,13 +459,17 @@ void nyx_device_state_disable_incremental(nyx_device_state_t *self)
 
 void nyx_device_state_restore(nyx_device_state_t *self)
 {
+    nyx_clock_debug_dump(self->incremental_mode ? "rst-pre(t)" : "rst-pre(r)");
     fdl_fast_reload(self->qemu_state);
+    nyx_clock_debug_dump("rst-postfdl"); /* after mblock memcpy (s->clock = root or tmp copy) */
     call_fast_change_handlers();
+    nyx_clock_debug_dump("rst-posthdl"); /* after KVM_SET_CLOCK (TSC not yet set to tmp) */
 }
 
 void nyx_device_state_post_restore(nyx_device_state_t *self)
 {
     set_tsc_value(self, self->incremental_mode);
+    nyx_clock_debug_dump("post-restore"); /* after TSC set to (tmp) value */
 }
 
 
@@ -465,6 +482,9 @@ void nyx_device_state_save_tsc(nyx_device_state_t *self)
 void nyx_device_state_save_tsc_incremental(nyx_device_state_t *self)
 {
     save_tsc_value(self, true);
+    /* tmp-create: fdl_fast_create_tmp (in switch_incremental, just ran) has already
+     * copied the live s->clock into tmp_snapshot.copy; env->tsc here is the tmp TSC. */
+    nyx_clock_debug_dump("tmp-create");
 }
 
 void nyx_device_state_serialize(nyx_device_state_t *self, const char *snapshot_folder)
