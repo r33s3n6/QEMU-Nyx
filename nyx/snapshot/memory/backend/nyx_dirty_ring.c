@@ -561,11 +561,132 @@ static int cmp_u64(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+/* ---- "blind restore" experiment (env NYX_BLIND_RESTORE=K) ----
+ * Idea (user 2026-06-22): ~95% of each race's dirty pages repeat the previous
+ * race (R~0.97), so instead of re-write-protecting every dirty page each round
+ * (one NPT write fault per page next round = the tracking tax), keep a
+ * PERSISTENT union of recently-dirtied GFNs, leave them WRITABLE (don't reset
+ * -> KVM doesn't re-protect them -> the guest's writes to them don't fault),
+ * and blindly memcpy the whole union back from golden each round. Only
+ * genuinely-new pages (outside the union) stay write-protected -> fault once
+ * -> get collected and added to the union. Every K rounds do a real
+ * KVM_RESET_DIRTY_RINGS (re-protect all + reclaim ring) and clear the union,
+ * to bound union growth / ring occupancy and re-capture the working set.
+ *
+ * Correctness: every page actually dirtied this round IS restored, because it
+ * is either already in the union (writable, blind-restored) or new (write-
+ * protected -> faults -> collected -> added -> restored). Restoring union
+ * pages NOT dirtied this round is a harmless golden->golden copy. Ring never
+ * overflows between resets because each page contributes <=1 entry per cycle
+ * (after its first fault it stays writable) and |union| << ring capacity.
+ *
+ * This also gives a clean A/B for the write-protect tax: guest_active at K=1
+ * (re-protect every round = current behavior) vs K large (few faults). */
+static uint64_t *blind_keep_stack[16] = { 0 };
+static void     *blind_keep_bm[16]    = { 0 };
+static uint64_t  blind_keep_ptr[16]   = { 0 };
+
+/* drain the dirty ring, add NEW gfns to the persistent union, mark entries
+ * harvested, but DO NOT call KVM_RESET_DIRTY_RINGS (pages stay writable).
+ * returns the number of new (distinct) faults this round. */
+static uint64_t blind_collect_no_reset(nyx_dirty_ring_t *self)
+{
+    uint64_t newf = 0;
+    while (true) {
+        struct kvm_dirty_gfn *entry =
+            &kvm_dirty_gfns[kvm_dirty_gfns_index & kvm_dirty_gfns_index_mask];
+        if ((entry->flags & 0x3) == 0) {
+            break;
+        }
+        if ((entry->flags & 0x1) == 1) {
+            uint64_t slot = entry->slot & 0xFFFF;
+            uint64_t gfn  = entry->offset;
+            slot_t  *s    = &self->kvm_region_slots[slot];
+            if (!blind_keep_bm[slot]) {
+                blind_keep_bm[slot]    = calloc(1, s->bitmap_size);
+                blind_keep_stack[slot] = malloc(s->bitmap_size * 8 * sizeof(uint64_t));
+            }
+            if (test_and_set_bit(gfn, blind_keep_bm[slot]) == false) {
+                blind_keep_stack[slot][blind_keep_ptr[slot]++] = gfn;
+                newf++;
+            }
+            entry->flags |= 0x2;
+        } else {
+            nyx_abort("[blind] bad dirty_gfn flags\n");
+        }
+        kvm_dirty_gfns_index++;
+    }
+    return newf;
+}
+
+/* memcpy the whole persistent union back from the golden snapshot. */
+static uint32_t blind_restore_union(nyx_dirty_ring_t          *self,
+                                    shadow_memory_t           *sms,
+                                    snapshot_page_blocklist_t *bl)
+{
+    uint32_t n = 0;
+    for (uint8_t j = 0; j < self->kvm_region_slots_num; j++) {
+        slot_t *s = &self->kvm_region_slots[j];
+        if (!s->enabled) {
+            continue;
+        }
+        uint64_t rid         = s->region_id;
+        uint64_t region_base = sms->ram_regions[rid].base;
+        uint64_t roff        = s->region_offset;
+        void    *host_base   = sms->ram_regions[rid].host_region_ptr;
+        void    *snap_base   = sms->incremental_enabled
+                                   ? sms->ram_regions[rid].incremental_region_ptr
+                                   : sms->ram_regions[rid].snapshot_region_ptr;
+        for (uint64_t i = 0; i < blind_keep_ptr[j]; i++) {
+            uint64_t eoa = roff + (blind_keep_stack[j][i] << 12);
+            if (snapshot_page_blocklist_check_phys_addr(bl, region_base + eoa)) {
+                continue;
+            }
+            memcpy(host_base + eoa, snap_base + eoa, TARGET_PAGE_SIZE);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* set whenever blind_collect_no_reset deferred a reset (harvested ring
+ * entries left un-reset so pages stay writable). Other code paths that call
+ * KVM_RESET_DIRTY_RINGS with assert(ret==cleared) (create_tmp save, root
+ * switch, normal restore) must first flush these, else KVM_RESET resets the
+ * deferred entries too and ret > cleared -> SIGABRT. */
+static int g_blind_deferred = 0;
+
+/* drain any outstanding ring entries, mark harvested, KVM_RESET (reprotect +
+ * reclaim), and clear the union — restores the invariant that no harvested-
+ * but-unreset entries remain, so the asserting paths see ret==cleared. */
+static void blind_flush_deferred(nyx_dirty_ring_t *self)
+{
+    while (true) {
+        struct kvm_dirty_gfn *entry =
+            &kvm_dirty_gfns[kvm_dirty_gfns_index & kvm_dirty_gfns_index_mask];
+        if ((entry->flags & 0x3) == 0) {
+            break;
+        }
+        if ((entry->flags & 0x1) == 1) {
+            entry->flags |= 0x2;
+        }
+        kvm_dirty_gfns_index++;
+    }
+    ioctl(kvm_get_vm_fd(kvm_state), KVM_RESET_DIRTY_RINGS, 0);
+    for (uint8_t j = 0; j < self->kvm_region_slots_num; j++) {
+        if (blind_keep_bm[j]) {
+            memset(blind_keep_bm[j], 0, self->kvm_region_slots[j].bitmap_size);
+        }
+        blind_keep_ptr[j] = 0;
+    }
+    g_blind_deferred = 0;
+}
+
 uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
                                              shadow_memory_t  *shadow_memory_state,
                                              snapshot_page_blocklist_t *blocklist)
 {
-    static int prof = -1, nt = 0, pingpong = 0, conc = 0;
+    static int prof = -1, nt = 0, pingpong = 0, conc = 0, blind = 0;
     if (prof < 0) {
         prof = getenv("NYX_RESTORE_PROFILE") ? 1 : 0;
         const char *e = getenv("NYX_RESTORE_PARALLEL");
@@ -573,10 +694,71 @@ uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
         const char *pp = getenv("NYX_PINGPONG_PROBE");
         pingpong = pp ? atoi(pp) : 0;
         conc = getenv("NYX_DIRTY_CONC") ? 1 : 0;
+        const char *br = getenv("NYX_BLIND_RESTORE");
+        blind = br ? atoi(br) : 0;
         const char *pe = getenv("NYX_PROBE_EVERY");
         if (pe && atoi(pe) > 0) {
             g_probe_every = atoi(pe);
         }
+    }
+
+    /* Leaving the blind fast-path (root rewind, or blind disabled) while a
+     * reset is deferred? Flush it first so the asserting normal/save paths see
+     * a clean ring. */
+    if (g_blind_deferred &&
+        !(blind > 0 && shadow_memory_state->incremental_enabled)) {
+        blind_flush_deferred(self);
+    }
+
+    /* Blind fast-path ONLY for same-layer tmp rewinds (incremental_enabled).
+     * Root rewinds / tmp->root switches go through the original path, which is
+     * combined with shadow_memory_restore_memory(root_track) at the caller —
+     * the blind union must not interfere with that. */
+    if (blind > 0 && shadow_memory_state->incremental_enabled) {
+        static uint64_t br_round = 0, acc_new = 0, acc_union = 0, brn = 0;
+        static uint64_t acc_collect_ns = 0, acc_restore_ns = 0;
+        uint64_t t0   = prof_now_ns();
+        uint64_t newf = blind_collect_no_reset(self);
+        uint64_t t1   = prof_now_ns();
+        uint32_t restored =
+            blind_restore_union(self, shadow_memory_state, blocklist);
+        uint64_t t2 = prof_now_ns();
+
+        br_round++;
+        int did_reset = 0;
+        if ((br_round % (uint64_t)blind) == 0) {
+            int ret = ioctl(kvm_get_vm_fd(kvm_state), KVM_RESET_DIRTY_RINGS, 0);
+            (void)ret;
+            for (uint8_t j = 0; j < self->kvm_region_slots_num; j++) {
+                if (blind_keep_bm[j]) {
+                    memset(blind_keep_bm[j], 0,
+                           self->kvm_region_slots[j].bitmap_size);
+                }
+                blind_keep_ptr[j] = 0;
+            }
+            did_reset = 1;
+        }
+        g_blind_deferred = did_reset ? 0 : 1;
+
+        acc_new        += newf;
+        acc_collect_ns += (t1 - t0);
+        acc_restore_ns += (t2 - t1);
+        uint64_t union_now = 0;
+        for (uint8_t j = 0; j < self->kvm_region_slots_num; j++) {
+            union_now += blind_keep_ptr[j];
+        }
+        acc_union += union_now;
+        brn++;
+        if (brn % g_probe_every == 0) {
+            fprintf(stderr,
+                    "[blind] K=%d n=%lu new_faults/race=%.1f union_avg=%.0f "
+                    "restored=%u collect=%.1fus restore=%.1fus last_reset=%d\n",
+                    blind, (unsigned long)brn, (double)acc_new / (double)brn,
+                    (double)acc_union / (double)brn, restored,
+                    acc_collect_ns / 1000.0 / (double)brn,
+                    acc_restore_ns / 1000.0 / (double)brn, did_reset);
+        }
+        return restored;
     }
 
     if (!prof) {
@@ -715,9 +897,25 @@ void nyx_snapshot_nyx_dirty_ring_save_root_pages(nyx_dirty_ring_t *self,
                                                  shadow_memory_t *shadow_memory_state,
                                                  snapshot_page_blocklist_t *blocklist)
 {
+    /* create-tmp boundary. If a blind reset is deferred, flush it FIRST so the
+     * flush_and_collect below sees a clean ring (its assert(ret==cleared)).
+     * blind_flush_deferred also clears the union (bounds it to one tmp). */
+    if (g_blind_deferred) {
+        blind_flush_deferred(self);
+    }
+
     dirty_ring_flush_and_collect(self, shadow_memory_state, blocklist,
                                  kvm_get_vm_fd(kvm_state));
     save_root_pages(self, shadow_memory_state, blocklist);
+
+    /* also clear the union here for the non-deferred case (bounds union to one
+     * tmp's lifetime; flush_and_collect above already re-protected all pages). */
+    for (uint8_t j = 0; j < self->kvm_region_slots_num; j++) {
+        if (blind_keep_bm[j]) {
+            memset(blind_keep_bm[j], 0, self->kvm_region_slots[j].bitmap_size);
+        }
+        blind_keep_ptr[j] = 0;
+    }
 }
 
 void nyx_snapshot_nyx_dirty_ring_flush(void)
@@ -729,6 +927,17 @@ void nyx_snapshot_nyx_dirty_ring_flush_and_collect(nyx_dirty_ring_t *self,
                                                    shadow_memory_t *shadow_memory_state,
                                                    snapshot_page_blocklist_t *blocklist)
 {
+    /* dirty-ring-full handler may fire mid-race in blind mode. Capture any
+     * outstanding faults into the union (so nothing is lost), then reset MY
+     * deferred entries so the flush_and_collect below sees a clean ring
+     * (assert ret==cleared). Union is kept; pages are re-protected and will
+     * re-fault if written again. In practice |union| << ring capacity so this
+     * rarely fires. */
+    if (g_blind_deferred) {
+        blind_collect_no_reset(self);
+        ioctl(kvm_get_vm_fd(kvm_state), KVM_RESET_DIRTY_RINGS, 0);
+        g_blind_deferred = 0;
+    }
     dirty_ring_flush_and_collect(self, shadow_memory_state, blocklist,
                                  kvm_get_vm_fd(kvm_state));
 }
