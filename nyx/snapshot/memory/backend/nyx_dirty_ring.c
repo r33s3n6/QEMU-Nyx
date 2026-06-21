@@ -550,17 +550,29 @@ static void pingpong_tick(nyx_dirty_ring_t *self, int pingpong)
     }
 }
 
+/* T2 dirty-page concentration probe (env NYX_DIRTY_CONC): for the current
+ * race's dirty GFN set, count contiguous runs and distinct 2MB windows per
+ * slot, so we can judge hugepage / locality feasibility. Computed in the
+ * untimed region (after collect, before writeback clears the stacks); does
+ * not pollute collect/writeback timing. Accumulators + periodic print only. */
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
 uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
                                              shadow_memory_t  *shadow_memory_state,
                                              snapshot_page_blocklist_t *blocklist)
 {
-    static int prof = -1, nt = 0, pingpong = 0;
+    static int prof = -1, nt = 0, pingpong = 0, conc = 0;
     if (prof < 0) {
         prof = getenv("NYX_RESTORE_PROFILE") ? 1 : 0;
         const char *e = getenv("NYX_RESTORE_PARALLEL");
         nt = e ? atoi(e) : 0;
         const char *pp = getenv("NYX_PINGPONG_PROBE");
         pingpong = pp ? atoi(pp) : 0;
+        conc = getenv("NYX_DIRTY_CONC") ? 1 : 0;
         const char *pe = getenv("NYX_PROBE_EVERY");
         if (pe && atoi(pe) > 0) {
             g_probe_every = atoi(pe);
@@ -610,6 +622,65 @@ uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
             set_bit(s->stack[i], (unsigned long *)prev_bm[j]);
         }
         prev_cnt[j] = s->stack_ptr;
+    }
+
+    /* ---- T2 concentration (env-gated, untimed) ---- */
+    static uint64_t acc_runs = 0, acc_win2m = 0, acc_cdirty = 0, acc_slots = 0;
+    static uint64_t cn = 0, max_win_pages = 0;
+    static uint64_t *sortbuf = NULL;
+    static uint64_t  sortcap = 0;
+    if (conc) {
+        for (uint8_t j = 0; j < self->kvm_region_slots_num && j < 16; j++) {
+            slot_t *s = &self->kvm_region_slots[j];
+            if (s->stack_ptr == 0) {
+                continue;
+            }
+            if (s->stack_ptr > sortcap) {
+                sortcap = s->stack_ptr;
+                sortbuf = realloc(sortbuf, sortcap * sizeof(uint64_t));
+            }
+            memcpy(sortbuf, s->stack, s->stack_ptr * sizeof(uint64_t));
+            qsort(sortbuf, s->stack_ptr, sizeof(uint64_t), cmp_u64);
+            uint64_t runs = 1, win = 1;
+            uint64_t cur_win = sortbuf[0] >> 9;      /* 2MB window = 512 pages */
+            uint64_t cur_win_pages = 1;
+            for (uint64_t i = 1; i < s->stack_ptr; i++) {
+                if (sortbuf[i] != sortbuf[i - 1] + 1) {
+                    runs++;
+                }
+                uint64_t w = sortbuf[i] >> 9;
+                if (w != cur_win) {
+                    if (cur_win_pages > max_win_pages) {
+                        max_win_pages = cur_win_pages;
+                    }
+                    win++;
+                    cur_win = w;
+                    cur_win_pages = 1;
+                } else {
+                    cur_win_pages++;
+                }
+            }
+            if (cur_win_pages > max_win_pages) {
+                max_win_pages = cur_win_pages;
+            }
+            acc_runs   += runs;
+            acc_win2m  += win;
+            acc_cdirty += s->stack_ptr;
+            acc_slots  += 1;
+        }
+        cn++;
+        if (cn % g_probe_every == 0) {
+            double dr = (double)acc_cdirty / (double)cn;
+            fprintf(stderr,
+                    "[dirty-conc] n=%lu dirty/race=%.0f runs/race=%.1f "
+                    "win2M/race=%.1f pages_per_2M=%.1f avg_run_len=%.1f "
+                    "slots/race=%.1f max_win_pages=%lu\n",
+                    (unsigned long)cn, dr, (double)acc_runs / (double)cn,
+                    (double)acc_win2m / (double)cn,
+                    acc_win2m ? (double)acc_cdirty / (double)acc_win2m : 0.0,
+                    acc_runs ? (double)acc_cdirty / (double)acc_runs : 0.0,
+                    (double)acc_slots / (double)cn, (unsigned long)max_win_pages);
+        }
     }
 
     uint64_t t2  = prof_now_ns();
