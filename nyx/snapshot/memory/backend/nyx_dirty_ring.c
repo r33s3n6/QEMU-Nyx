@@ -377,6 +377,10 @@ static void save_root_pages(nyx_dirty_ring_t          *self,
  *    and measure re-touch ratio R = |this dirty ∩ prev dirty| / |prev dirty|.
  *  NYX_RESTORE_PARALLEL=N : do the page writeback with N host threads (memcpy is bandwidth-bound;
  *    serial restore is single-core). N=0/unset -> serial restore_memory(). */
+/* print period for restore-prof / pingpong-probe lines (env NYX_PROBE_EVERY, default 200).
+ * lower it for the slow lock-wait path (2s/race) where 200 restores would take forever. */
+static int g_probe_every = 200;
+
 static inline uint64_t prof_now_ns(void)
 {
     struct timespec ts;
@@ -538,7 +542,7 @@ static void pingpong_tick(nyx_dirty_ring_t *self, int pingpong)
     static uint64_t acc_zap = 0, acc_pf = 0, n = 0;
     pingpong_zap_and_prefault(self, pingpong >= 2, &acc_zap, &acc_pf);
     n++;
-    if (n % 200 == 0) {
+    if (n % g_probe_every == 0) {
         fprintf(stderr,
                 "[pingpong-probe] mode=%d n=%lu zap=%.1fus prefault=%.1fus\n",
                 pingpong, (unsigned long)n, acc_zap / 1000.0 / (double)n,
@@ -557,6 +561,10 @@ uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
         nt = e ? atoi(e) : 0;
         const char *pp = getenv("NYX_PINGPONG_PROBE");
         pingpong = pp ? atoi(pp) : 0;
+        const char *pe = getenv("NYX_PROBE_EVERY");
+        if (pe && atoi(pe) > 0) {
+            g_probe_every = atoi(pe);
+        }
     }
 
     if (!prof) {
@@ -614,7 +622,7 @@ uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
     acc_dirty        += this_dirty;
     n++;
 
-    if (n % 200 == 0) {
+    if (n % g_probe_every == 0) {
         double col_us = acc_collect_ns / 1000.0 / (double)n;
         double wb_us  = acc_writeback_ns / 1000.0 / (double)n;
         double tot    = col_us + wb_us;
