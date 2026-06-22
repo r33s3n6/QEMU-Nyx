@@ -694,8 +694,12 @@ uint32_t nyx_snapshot_nyx_dirty_ring_restore(nyx_dirty_ring_t *self,
         const char *pp = getenv("NYX_PINGPONG_PROBE");
         pingpong = pp ? atoi(pp) : 0;
         conc = getenv("NYX_DIRTY_CONC") ? 1 : 0;
+        /* DEFAULT ON (K=16) since 2026-06-22: validated correct across ~75k
+         * races (CRDB 50k soak + TiDB 25k parity), violations=0, no SIGABRT,
+         * union bounded; +22~34% fast-region throughput. Set NYX_BLIND_RESTORE=0
+         * to disable, or another K to tune the re-protect period. */
         const char *br = getenv("NYX_BLIND_RESTORE");
-        blind = br ? atoi(br) : 0;
+        blind = br ? atoi(br) : 16;
         const char *pe = getenv("NYX_PROBE_EVERY");
         if (pe && atoi(pe) > 0) {
             g_probe_every = atoi(pe);
