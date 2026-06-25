@@ -140,6 +140,13 @@ static void nyx_interface_receive(void *opaque, const uint8_t *buf, int size)
         case NYX_INTERFACE_PING:
             synchronization_unlock();
             break;
+        case NYX_INTERFACE_RELOAD:
+            /* HOST-CONTROLLED REWIND (stalefuzz): the host asks us to rewind the VM. We are on the main-
+             * loop thread here, so we only flag the request + wake the guest; the actual reset runs on the
+             * vCPU thread (in synchronization_lock), after which the guest reprimes to its next
+             * next_payload. No guest release is involved. */
+            synchronization_request_host_reset();
+            break;
         case '\n':
             break;
         case 'E':

@@ -24,6 +24,13 @@ pthread_mutex_t synchronization_disable_pt_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile bool synchronization_reload_pending   = false;
 volatile bool synchronization_kvm_loop_waiting = false;
 
+/* HOST-CONTROLLED REWIND (stalefuzz 2026-06-25): set by synchronization_request_host_reset() on the QEMU
+ * main-loop (interface 'r') thread, consumed by synchronization_lock() on the vCPU thread — the correct
+ * context for perform_reload (fast_reload_restore). perform_reload is defined further down, so forward-
+ * declare it for synchronization_lock(). */
+static volatile bool host_reset_pending = false;
+static void perform_reload(void);
+
 
 /* SIGALRM based timeout detection */
 // #define DEBUG_TIMEOUT_DETECTOR
@@ -266,6 +273,16 @@ void synchronization_lock(void)
     check_auxiliary_config_buffer(GET_GLOBAL_STATE()->auxilary_buffer,
                                   &GET_GLOBAL_STATE()->shadow_config);
 
+    /* HOST-CONTROLLED REWIND (stalefuzz): if the host requested a rewind via the 'r' control byte, do the
+     * actual reset HERE — on the vCPU thread, the correct context for fast_reload_restore. This fires ONLY
+     * when the flag is set (a host 'r'), never for an ordinary command, so commands run normally. It
+     * rewinds the VM to the snapshot; the guest then reprimes from the snapshot to its next next_payload. */
+    if (host_reset_pending) {
+        host_reset_pending = false;
+        handle_tmp_snapshot_state();
+        perform_reload();
+    }
+
     set_success_auxiliary_result_buffer(GET_GLOBAL_STATE()->auxilary_buffer, 1);
     reset_pt_overflow_auxiliary_result_buffer(GET_GLOBAL_STATE()->auxilary_buffer);
 
@@ -284,6 +301,21 @@ static void perform_reload(void)
     } else {
         nyx_warn("Root snapshot is not available yet!\n");
     }
+}
+
+/* HOST-CONTROLLED REWIND (stalefuzz 2026-06-25): the host writes the NYX_INTERFACE_RELOAD ('r') byte to
+ * request a VM rewind (e.g. after inspecting/dumping a violation's dirty post-run state). This runs on the
+ * QEMU main-loop (interface receive) thread, so it must NOT touch VM/vCPU state — fast_reload_restore must
+ * run on the vCPU thread. So we only set a flag (under the same mutex the guest's cond_wait uses, so the
+ * guest is guaranteed to see it) and wake the guest; synchronization_lock() (vCPU thread) sees the flag
+ * right after waking and runs the actual perform_reload() there, after which the guest reprimes from the
+ * snapshot to its next next_payload. No guest release/hypercall is involved in the reset itself. */
+void synchronization_request_host_reset(void)
+{
+    pthread_mutex_lock(&synchronization_lock_mutex);
+    host_reset_pending = true;
+    pthread_cond_signal(&synchronization_lock_condition);
+    pthread_mutex_unlock(&synchronization_lock_mutex);
 }
 
 void synchronization_lock_crash_found(void)
@@ -411,14 +443,13 @@ void synchronization_disable_pt(CPUState *cpu)
 
     pt_disable(qemu_get_cpu(0), false);
 
-    handle_tmp_snapshot_state();
-
-    if (GET_GLOBAL_STATE()->in_reload_mode ||
-        GET_GLOBAL_STATE()->in_redqueen_reload_mode || GET_GLOBAL_STATE()->dump_page ||
-        fast_reload_tmp_created(get_fast_reload_snapshot()))
-    {
-        perform_reload();
-    }
+    // HOST-CONTROLLED REWIND (stalefuzz 2026-06-25): the guest no longer resets the VM on release — it
+    // just finishes the run and flows on to its next next_payload, leaving the VM on the dirty post-run
+    // state so the host can inspect/dump it. The reset is PURELY host-driven: the host writes the
+    // NYX_INTERFACE_RELOAD ('r') control byte when it decides to rewind, which calls
+    // synchronization_reset_from_host() (the SAME fast_reload_restore as the old release path, just host-
+    // triggered). Special PT modes (redqueen / page-dump) keep their own immediate reload and don't enter
+    // this host loop.
 
     set_result_pt_trace_size(GET_GLOBAL_STATE()->auxilary_buffer,
                              GET_GLOBAL_STATE()->pt_trace_size);

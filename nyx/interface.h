@@ -27,6 +27,9 @@ along with QEMU-PT.  If not, see <http://www.gnu.org/licenses/>.
 #define DEFAULT_NYX_BITMAP_SIZE      0x10000 /* default bitmap size => 64k */
 
 #define NYX_INTERFACE_PING 'x'
+/* HOST-CONTROLLED REWIND (stalefuzz): host writes this byte on the control socket to reset (rewind) the
+ * VM directly — no guest release involved. Handled by synchronization_reset_from_host(). */
+#define NYX_INTERFACE_RELOAD 'r'
 
 bool interface_send_char(char val);
 

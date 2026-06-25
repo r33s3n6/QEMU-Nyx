@@ -26,6 +26,11 @@ void unblock_signals(void);
 
 void synchronization_unlock(void);
 
+/* HOST-CONTROLLED REWIND (stalefuzz): the host requests a VM rewind via the NYX_INTERFACE_RELOAD 'r'
+ * control byte. This (main-loop thread) only flags the request + wakes the guest; the actual
+ * perform_reload runs on the vCPU thread inside synchronization_lock(). No guest release is involved. */
+void synchronization_request_host_reset(void);
+
 void synchronization_lock_hprintf(void);
 
 
